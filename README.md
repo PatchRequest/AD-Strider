@@ -1,1 +1,1 @@
-# py-ad-strider
+# AD Strider
