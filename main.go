@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
 )
@@ -23,42 +24,56 @@ func main() {
 	password := flag.String("password", "neo4j", "Password for neo4j server Default: neo4j")
 	filepath := flag.String("filepath", "./tier0.txt", "Path to file containing list of elements to add tier flag to")
 	flag.Parse()
-
 	if !strings.HasPrefix(*uri, "bolt://") {
 		*uri = "bolt://" + *uri
 	}
-
+	fmt.Println("Connecting to neo4j server at: ", *uri, " ...")
+	// Connect to the database
 	driver, err := neo4j.NewDriver(*uri, neo4j.BasicAuth(*username, *password, ""))
 	if err != nil {
 		panic(err)
 	}
 	defer driver.Close()
-
-	// check if driver is working
+	fmt.Println("Reading Config file...")
+	// Read the config file
 	configData, err := os.ReadFile("./config.json")
 	if err != nil {
 		panic(err)
 	}
-
+	fmt.Println("Parsing Config file...")
+	// Parse the Config file
 	err = json.Unmarshal(configData, &config)
 	if err != nil {
 		panic(err)
 	}
-
-	// check if driver is working
+	fmt.Println("Cleaning current tier0 flag...")
+	// clean current tier0
+	err = cleanCurrentTier0(driver)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Reading tier0 file...")
+	// Read Tier0 File
 	dat, err := os.ReadFile(*filepath)
 	if err != nil {
 		panic(err)
 	}
-
+	fmt.Println("Adding tier0 flag to elements...")
+	// Add Tier0 Flag to elements
 	for _, elementName := range strings.Split(string(dat), "\n") {
 		go addTierFlagToElement(driver, elementName)
 
 	}
 	wg.Wait()
+	fmt.Println("Analyzing all jumps...")
+	// Check all jumps
 	getAllJumps(driver)
+
 	wg.Wait()
-	f, err := os.OpenFile("badConnections.csv", os.O_WRONLY|os.O_CREATE, 0600)
+	fmt.Println("Writing bad jumps to file...")
+	// Print out bad jumps
+	t := strconv.FormatInt(int64(time.Now().Unix()), 10)
+	f, err := os.OpenFile("badConnections"+t+".csv", os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
 		panic(err)
 	}
@@ -77,10 +92,25 @@ func main() {
 
 }
 
+func cleanCurrentTier0(driver neo4j.Driver) error {
+	session := driver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close()
+
+	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
+
+		result, err := tx.Run("MATCH (n) WHERE n.tier0=true REMOVE n.tier0 RETURN n", map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		result.Consume()
+		return nil, err
+	})
+	return err
+}
+
 func addTierFlagToElement(driver neo4j.Driver, elementName string) error {
 	wg.Add(1)
 	defer wg.Done()
-	// check length of elementName
 	if len(elementName) < 3 {
 		return nil
 	}
@@ -90,13 +120,25 @@ func addTierFlagToElement(driver neo4j.Driver, elementName string) error {
 	defer session.Close()
 
 	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
-		// MATCH (n) WHERE toLower(n.name) CONTAINS toLower("TFNCAAPAP001") SET n.tier0=true RETURN n
-
-		result, err := tx.Run("MATCH (n) WHERE toLower(n.name) CONTAINS toLower($elementName) SET n.tier0=true RETURN n", map[string]interface{}{"elementName": elementName})
+		searchString := ""
+		if strings.Contains(elementName, "@") {
+			searchString = "MATCH (n) WHERE toLower(n.name) = toLower($elementName) SET n.tier0=true RETURN n"
+		} else {
+			searchString = "MATCH (n) WHERE toLower(n.name) CONTAINS toLower($elementName) SET n.tier0=true RETURN n"
+		}
+		result, err := tx.Run(searchString, map[string]interface{}{"elementName": elementName})
 		if err != nil {
 			return nil, err
 		}
-		result.Consume()
+		// how many nodes were affected?
+		affected, err := result.Consume()
+		if err != nil {
+			return nil, err
+		}
+		if affected.Counters().PropertiesSet() > 5 {
+			fmt.Printf("High false positive marked rate for %s with %d nodes affected\n", elementName, affected.Counters().PropertiesSet())
+		}
+
 		return nil, err
 	})
 
@@ -108,9 +150,8 @@ func getAllJumps(driver neo4j.Driver) error {
 	session := driver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
 
 	defer session.Close()
-	i := 0
+
 	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
-		// MATCH (n) WHERE toLower(n.name) CONTAINS toLower("TFNCAAPAP001") SET n.tier0=true RETURN n
 
 		result, err := tx.Run("MATCH (m WHERE m.tier0) -[r]- (x WHERE NOT EXISTS(x.tier0) AND EXISTS(x.domain) ) return m,r,x", map[string]interface{}{})
 		if err != nil {
@@ -128,8 +169,7 @@ func getAllJumps(driver neo4j.Driver) error {
 			} else {
 				go anaylseConnection(TierConnection{StartEntity: other_device, Relationship: relationship, EndEntity: tier0_device, IntoT0: true})
 			}
-			fmt.Println("Analyzing: ", i)
-			i = i + 1
+
 		}
 
 		return nil, err
@@ -141,6 +181,11 @@ func getAllJumps(driver neo4j.Driver) error {
 }
 
 func anaylseConnection(connection TierConnection) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println("panic occurred:", err)
+		}
+	}()
 	wg.Add(1)
 	defer wg.Done()
 	if connection.IntoT0 {
