@@ -22,11 +22,6 @@ jobs:
 
     - name: Test
       run: go test -v ./...
-    
-    - uses: ncipollo/release-action@v1
-      with:
-        artifacts: "main*"
-        token: ${{ secrets.GITHUB_TOKEN }}
 
 
  
